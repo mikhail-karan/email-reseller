@@ -1,0 +1,149 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { render, route } from "rwsdk/router";
+import { defineApp, type RequestInfo } from "rwsdk/worker";
+
+import { Document } from "@/app/document";
+import { setCommonHeaders } from "@/app/headers";
+import { checkOrigin, cors, redirect, requireSignedIn, requireUser } from "@/app/http";
+import { pageNotFound, requireAdmin, requireFolder, requireMailbox, requireRecord, requireThread } from "@/app/access";
+import { AdminMailboxPage, AdminPage } from "@/app/pages/admin";
+import { AdminDomainPage } from "@/app/pages/domains";
+import { Button } from "@/app/components/ui/button";
+import { AuthCard, LoginPage, LoginVerifyPage, SetupPage, loginAction, loginVerifyAction, logoutAction, setupAction } from "@/app/pages/auth";
+import { SecurityPage } from "@/app/pages/security";
+import { ComposePage, SettingsPage } from "@/app/pages/compose";
+import { attachmentHandler, bodyHandler, rawHandler } from "@/app/pages/files";
+import { FolderPage, ThreadPage } from "@/app/pages/mailbox";
+import { type User, getUserFromRequest } from "@/lib/auth";
+import { listMailboxesForUser } from "@/lib/db";
+import { handleInbound } from "@/lib/inbound";
+import { retryDueDeliveries } from "@/lib/webhooks";
+import { purgeOldSpam } from "@/lib/spam";
+import {
+  apiNotFound,
+  attachmentApiHandler,
+  listHandler,
+  mailboxesHandler,
+  messageActionHandler,
+  messageHandler,
+  sendHandler,
+} from "@/app/api";
+import { DevelopersPage, WebhookPage } from "@/app/pages/developers";
+import { mcpHandler } from "@/app/mcp";
+import {
+  AuthorizePage,
+  authorizationServerMetadata,
+  authorizeAction,
+  protectedResourceMetadata,
+  registerHandler,
+  revokeHandler,
+  tokenHandler,
+} from "@/app/pages/oauth";
+import { purgeExpiredOAuth } from "@/lib/oauth";
+
+export type AppContext = { user: User | null };
+
+async function home({ ctx }: RequestInfo) {
+  const boxes = await listMailboxesForUser(ctx.user!);
+  if (boxes.length) return redirect(`/mb/${boxes[0].id}/inbox`);
+  return redirect(ctx.user!.role === "admin" ? "/admin" : "/no-mailbox");
+}
+
+const app = defineApp([
+  setCommonHeaders(),
+  checkOrigin,
+  async ({ ctx, request }) => {
+    ctx.user = await getUserFromRequest(request);
+  },
+
+  // Raw (non-HTML-document) endpoints
+  route("/logout", { post: logoutAction }),
+  route("/attachments/:id", [requireUser, attachmentHandler]),
+  route("/raw/:id", [requireUser, rawHandler]),
+  route("/body/:id", [requireUser, bodyHandler]),
+  // Public API (API keys, no cookies). See src/app/api.ts.
+  route("/api/v1/send", { post: sendHandler }),
+  route("/api/v1/mailboxes", { get: mailboxesHandler }),
+  route("/api/v1/messages", { get: listHandler }),
+  route("/api/v1/messages/:id", { get: messageHandler, post: messageActionHandler }),
+  route("/api/v1/attachments/:id", { get: attachmentApiHandler }),
+  route("/api/*", apiNotFound),
+  // MCP for AI assistants (src/app/mcp.ts), and OAuth so they connect by signing in (src/app/pages/oauth.tsx).
+  // These answer browser-based assistants too (CORS); they read tokens, never cookies.
+  route("/mcp", cors("/mcp", ["GET", "POST"], mcpHandler)),
+  route("/.well-known/oauth-protected-resource", cors("/.well-known/oauth-protected-resource", ["GET", "HEAD"], protectedResourceMetadata)),
+  route("/.well-known/oauth-protected-resource/mcp", cors("/.well-known/oauth-protected-resource/mcp", ["GET", "HEAD"], protectedResourceMetadata)),
+  route("/.well-known/oauth-authorization-server", cors("/.well-known/oauth-authorization-server", ["GET", "HEAD"], authorizationServerMetadata)),
+  route("/oauth/register", cors("/oauth/register", ["POST"], registerHandler)),
+  route("/oauth/token", cors("/oauth/token", ["POST"], tokenHandler)),
+  route("/oauth/revoke", cors("/oauth/revoke", ["POST"], revokeHandler)),
+
+  render(Document, [
+    route("/setup", { get: SetupPage, post: setupAction }),
+    route("/login", { get: LoginPage, post: loginAction }),
+    route("/login/verify", { get: LoginVerifyPage, post: loginVerifyAction }),
+    route("/oauth/authorize", { get: AuthorizePage, post: authorizeAction }),
+    // Open even when two-step is required and not set up yet: it's where it gets set up.
+    route("/account/security", [requireSignedIn, SecurityPage]),
+    route("/", [requireUser, home]),
+    route("/no-mailbox", [
+      requireUser,
+      () => (
+        <AuthCard title="No mailbox yet">
+          <p className="text-sm text-muted-foreground">Ask an admin to give you access to a mailbox, then sign in again.</p>
+          <form method="post" action="/logout" className="mt-5">
+            <Button variant="outline" className="w-full">
+              Log out
+            </Button>
+          </form>
+        </AuthCard>
+      ),
+    ]),
+
+    // Pages. Their forms call server functions (src/app/actions), which rwsdk
+    // posts to the page URL itself; each function checks access on its own too.
+    route("/admin", [requireAdmin, AdminPage]),
+    route("/admin/api", [requireAdmin, DevelopersPage]),
+    route("/admin/webhooks/:id", [requireAdmin, requireRecord("webhooks", "webhook"), WebhookPage]),
+    route("/admin/domains/:id", [requireAdmin, requireRecord("domains", "domain"), AdminDomainPage]),
+    route("/admin/mailboxes/:id", [requireAdmin, requireRecord("mailboxes", "mailbox"), AdminMailboxPage]),
+    route("/admin/users/:id", [requireAdmin, () => redirect("/admin")]),
+
+    route("/mb/:mailboxId/compose", [requireUser, requireMailbox, ComposePage]),
+    route("/mb/:mailboxId/settings", [requireUser, requireMailbox, SettingsPage]),
+    route("/mb/:mailboxId/thread/:threadId", [requireUser, requireMailbox, requireThread, ThreadPage]),
+    route("/mb/:mailboxId/:folder", [requireUser, requireMailbox, requireFolder, FolderPage]),
+
+    // Anything else: "Page not found" (signed in or not).
+    route("/*", pageNotFound),
+  ]),
+]);
+
+/**
+ * Worker entrypoint: HTTP goes to the rwsdk app, inbound mail (Email Routing
+ * catch-all → this Worker) is parsed and stored in D1 + R2.
+ */
+export default class MailWorker extends WorkerEntrypoint<Env> {
+  async email(message: ForwardableEmailMessage) {
+    try {
+      await handleInbound(message);
+    } catch (err) {
+      console.error("inbound mail failed", err);
+      // Temporary failure → sending server will retry later.
+      message.setReject("451 4.3.0 Temporary failure, please retry");
+    }
+  }
+
+  /** Cron (every minute): retry due webhook deliveries; once an hour, purge old spam and expired sign-in tokens. */
+  async scheduled(controller: ScheduledController) {
+    await retryDueDeliveries();
+    if (new Date(controller.scheduledTime).getUTCMinutes() === 0) {
+      await purgeOldSpam();
+      await purgeExpiredOAuth();
+    }
+  }
+
+  override async fetch(request: Request) {
+    return app.fetch(request, this.env, this.ctx);
+  }
+}

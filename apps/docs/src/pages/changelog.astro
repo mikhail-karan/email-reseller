@@ -1,0 +1,22 @@
+---
+import StarlightPage from "@astrojs/starlight/components/StarlightPage.astro";
+import { renderChangelog, repo } from "../lib/changelog";
+
+const { code, headings, editUrl } = await renderChangelog("CHANGELOG.md");
+---
+
+<StarlightPage
+  frontmatter={{
+    title: "Changelog",
+    description: "Every GentleMail release, newest first: what was added, changed and fixed, and what to do when upgrading.",
+    editUrl,
+  }}
+  headings={headings}
+>
+  <p>
+    Every release, newest first. Each one is also a <a href={`${repo}/releases`}>GitHub release</a>, and
+    the <strong>Upgrading</strong> notes say what to do when you deploy it. The JavaScript SDK has
+    <a href="/docs/sdk/changelog/">its own changelog</a>.
+  </p>
+  <Fragment set:html={code} />
+</StarlightPage>
